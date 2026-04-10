@@ -434,7 +434,7 @@ async def build_pdf(
             
             # --- CRITICAL FIX: MEMORY-SAFE CRISP RESOLUTION ---
             # 200 DPI / 85% Quality prevents the 512MB RAM Crash while maintaining crisp visuals
-            pix = page_orig.get_pixmap(dpi=200)
+            pix = page_orig.get_pixmap(dpi=250)
             img_data = pix.tobytes("jpeg", 85)
             with open(img_path, "wb") as img_file:
                 img_file.write(img_data)
