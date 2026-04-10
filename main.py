@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger('weasyprint').setLevel(logging.ERROR)
 logging.getLogger('fontTools').setLevel(logging.ERROR)
 
-app = FastAPI(title="MediA11y Enterprise PDF Accessibility Engine")
+app = FastAPI(title="MediA11y Enterprise PDF - CRISP WORKER")
 
 # =================================================================
 # UTILITY FUNCTIONS
@@ -184,7 +184,27 @@ def build_form_control(page_index: int, field_index: int, f: dict) -> str:
 
 @app.get("/healthz")
 def health_check():
-    return {"status": "online", "version": "75.0.0-ULTRA-CRISP-RESOLUTION"}
+    return {"status": "online", "version": "78.0.0-CRISP-200DPI-FIXED"}
+
+# =================================================================
+# ENDPOINT: INSTANT PAGE COUNTER (FOR N8N ROUTING)
+# =================================================================
+
+@app.post("/get-page-count")
+async def get_page_count(file: UploadFile = File(...)):
+    try:
+        temp_pdf = f"/tmp/count_{uuid.uuid4()}.pdf"
+        with open(temp_pdf, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        doc = fitz.open(temp_pdf)
+        pages = len(doc)
+        doc.close()
+        os.remove(temp_pdf)
+        
+        return JSONResponse(content={"total_pages": pages})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 # =================================================================
 # ENDPOINT: DETECT FORMS
@@ -334,7 +354,7 @@ async def split_pdf_to_queue(file: UploadFile = File(...), original_pdf_url: str
             blocks = page.get_text("blocks")
             page_text = "\n".join([re.sub(r"MediaAlly|MediaA11y", "MediA11y", b[4]) for b in blocks if len(b) > 6 and b[6] == 0])
             
-            # --- INCREASED TO 150 DPI FOR CRISPER AI TEXT RECOGNITION ---
+            # --- 150 DPI FOR CRISPER AI TEXT RECOGNITION ---
             pix = page.get_pixmap(dpi=150)
             b64_img = base64.b64encode(pix.tobytes("jpeg", 90)).decode("utf-8")
             
@@ -412,14 +432,15 @@ async def build_pdf(
             img_path = f"/tmp/img_{req_id}_{i}.jpg"
             temp_image_paths.append(img_path)
             
-            # --- CRITICAL FIX: ULTRA CRISP RESOLUTION ---
-            # Increased from 120 DPI / 80% Quality to Print-Standard 300 DPI / 95% Quality
-            pix = page_orig.get_pixmap(dpi=300)
-            img_data = pix.tobytes("jpeg", 95)
+            # --- CRITICAL FIX: MEMORY-SAFE CRISP RESOLUTION ---
+            # 200 DPI / 85% Quality prevents the 512MB RAM Crash while maintaining crisp visuals
+            pix = page_orig.get_pixmap(dpi=200)
+            img_data = pix.tobytes("jpeg", 85)
             with open(img_path, "wb") as img_file:
                 img_file.write(img_data)
             del img_data
             pix = None
+            gc.collect()
 
             block = []
             block.append(f'<div id="page_{i}" class="visual-page" style="page: page_{i}; position: relative; width: {w}pt; height: {h}pt; page-break-after: always; overflow: hidden; background-color: white;">')
@@ -649,24 +670,5 @@ async def split_pdf_legacy(file: UploadFile = File(...)):
             })
         doc.close()
         return {"metadata": metadata_payload, "total_chunks": len(chunks), "chunks": chunks}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-        # =================================================================
-# ENDPOINT: INSTANT PAGE COUNTER (FOR N8N ROUTING)
-# =================================================================
-@app.post("/get-page-count")
-async def get_page_count(file: UploadFile = File(...)):
-    try:
-        temp_pdf = f"/tmp/count_{uuid.uuid4()}.pdf"
-        with open(temp_pdf, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        doc = fitz.open(temp_pdf)
-        pages = len(doc)
-        doc.close()
-        os.remove(temp_pdf)
-        
-        return JSONResponse(content={"total_pages": pages})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
