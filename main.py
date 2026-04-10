@@ -651,3 +651,22 @@ async def split_pdf_legacy(file: UploadFile = File(...)):
         return {"metadata": metadata_payload, "total_chunks": len(chunks), "chunks": chunks}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+        # =================================================================
+# ENDPOINT: INSTANT PAGE COUNTER (FOR N8N ROUTING)
+# =================================================================
+@app.post("/get-page-count")
+async def get_page_count(file: UploadFile = File(...)):
+    try:
+        temp_pdf = f"/tmp/count_{uuid.uuid4()}.pdf"
+        with open(temp_pdf, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        doc = fitz.open(temp_pdf)
+        pages = len(doc)
+        doc.close()
+        os.remove(temp_pdf)
+        
+        return JSONResponse(content={"total_pages": pages})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
