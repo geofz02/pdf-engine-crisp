@@ -387,7 +387,8 @@ async def build_pdf(
     corrected_forms_json: str = Form("{}"),
     original_pdf: UploadFile = File(...),
     document_title: str = Form(...),
-    pdf_keywords: str = Form("")
+    pdf_keywords: str = Form(""),
+    guide_style: str = Form("classic")
 ):
     req_id = str(uuid.uuid4())
     orig_path = f"/tmp/temp_orig_{req_id}.pdf"
@@ -413,8 +414,12 @@ async def build_pdf(
         if not pdf_subject or pdf_subject.strip() == "":
             pdf_subject = pdf_title
         final_keywords = pdf_keywords if pdf_keywords.strip() else orig_meta.get("keywords", "Accessibility, PDF/UA")
-        pdf_creator = "MediA11y"
-        pdf_producer = "MediA11y"
+        if guide_style == "v2":
+            pdf_creator = "MediaA11y"
+            pdf_producer = "MediaA11y"
+        else:
+            pdf_creator = "MediA11y"
+            pdf_producer = "MediA11y"
         pdf_creation_date = orig_meta.get("creationDate") or fitz.get_pdf_now()
 
         ai_forms = normalize_forms_payload(corrected_forms_json)
@@ -485,7 +490,10 @@ async def build_pdf(
                 block.append(build_form_control(i, field_index, field))
             
             # Layer 4: Footer Badge
-            block.append(f'<div style="position: absolute; bottom: 15pt; right: 15pt; background-color: #ffffff; z-index: 100; border: 1pt solid #000000; padding: 4pt 8pt; display: block; border-radius: 4pt;" aria-hidden="true"><div style="text-align: center; font-family: Arial, sans-serif; font-size: 10pt; font-weight: bold; color: #000000;">Visual Page {i + 1}</div></div>')
+            if guide_style == "v2":
+                block.append(f'<div style="position:absolute; top:0; left:0; right:0; background:#ffffff; z-index:100; border-bottom:1pt solid #000; padding:3pt 8pt; text-align:center; font-family:Arial,Helvetica,sans-serif; font-size:9pt; color:#000;" aria-hidden="true">Remediated by MediaA11y &nbsp;&#124;&nbsp; Visual page {i + 1} of {visual_count} &nbsp;&#124;&nbsp; Screen reader users: accessible text begins page {visual_count + 2}</div>')
+            else:
+                block.append(f'<div style="position: absolute; bottom: 15pt; right: 15pt; background-color: #ffffff; z-index: 100; border: 1pt solid #000000; padding: 4pt 8pt; display: block; border-radius: 4pt;" aria-hidden="true"><div style="text-align: center; font-family: Arial, sans-serif; font-size: 10pt; font-weight: bold; color: #000000;">Visual Page {i + 1}</div></div>')
             
             block.append('</div>')
             visual_html_blocks.append("".join(block))
@@ -503,6 +511,44 @@ async def build_pdf(
         visual_pages_toc = "Page 1" if visual_count == 1 else f"Pages 1-{visual_count}"
         guide_page = visual_count + 1
         text_start = visual_count + 2
+        visual_intro = (
+            "Page 1 contains the original visual document."
+            if visual_count == 1
+            else f"Pages 1–{visual_count} contain the original visual document."
+        )
+
+        if guide_style == "v2":
+            guide_html = f"""<div class="toc-page">
+        <h1>Accessibility Remediation Guide</h1>
+        <p><strong>Remediated by MediaA11y</strong></p>
+        <p>{escape_html(pdf_title)}</p>
+        <h2>Table of Contents</h2>
+        <ul>
+            <li><a href="#page_0">Section 1: Visual Document Pages</a> ({visual_pages_toc})</li>
+            <li><a href="#accessible-text">Section 2: Accessible Text Pages</a> ([TEXT_PAGES_TOC_PLACEHOLDER])</li>
+        </ul>
+        <h2>For Screen Reader Users:</h2>
+        <p>The accessible text versions of each page begin on page {text_start}. Navigate directly to page {text_start} to start reading the accessible content.</p>
+        <h2>For Sighted Users:</h2>
+        <p>{visual_intro} The accessible text versions ([TEXT_PAGES_RANGE]) provide the same content in a screen-reader-friendly format.</p>
+        <div style="margin-top: 40px; border-top: 1px solid #eee; padding-top: 12px;">
+            <p><strong>Remediated by:</strong> MediaA11y</p>
+        </div>
+    </div>"""
+        else:
+            guide_html = f"""<div class="toc-page">
+        <h1>Accessibility Remediation Guide</h1>
+        <p>This document has been enhanced for universal accessibility.</p>
+        <h2>Table of Contents</h2>
+        <ul>
+            <li><a href="#page_0">Section 1: Interactive Original Pages</a> ({visual_pages_toc})</li>
+            <li><a href="#remediation-info">Section 2: Remediation Information</a> (Page {guide_page})</li>
+            <li><a href="#accessible-text">Section 3: Accessible Narrative</a> ([TEXT_PAGES_TOC_PLACEHOLDER])</li>
+        </ul>
+        <div id="remediation-info" style="margin-top: 50px; border-top: 1px solid #eee;">
+            <p><strong>Remediated by:</strong> MediA11y</p>
+        </div>
+    </div>"""
 
         master_html = f"""
 <!DOCTYPE html>
@@ -539,19 +585,7 @@ async def build_pdf(
 <body>
     {''.join(visual_html_blocks)}
 
-    <div class="toc-page">
-        <h1>Accessibility Remediation Guide</h1>
-        <p>This document has been enhanced for universal accessibility.</p>
-        <h2>Table of Contents</h2>
-        <ul>
-            <li><a href="#page_0">Section 1: Interactive Original Pages</a> ({visual_pages_toc})</li>
-            <li><a href="#remediation-info">Section 2: Remediation Information</a> (Page {guide_page})</li>
-            <li><a href="#accessible-text">Section 3: Accessible Narrative</a> ([TEXT_PAGES_TOC_PLACEHOLDER])</li>
-        </ul>
-        <div id="remediation-info" style="margin-top: 50px; border-top: 1px solid #eee;">
-            <p><strong>Remediated by:</strong> MediA11y</p>
-        </div>
-    </div>
+    {guide_html}
 
     <div id="accessible-text" class="text-section">
         <h1 id="accessible-text-header">{escape_html(pdf_title)}</h1>
@@ -569,6 +603,8 @@ async def build_pdf(
         total_pages = len(temp_weasy_doc.pages)
         toc_text = f"(Page {text_start})" if total_pages == text_start else f"(Pages {text_start}-{total_pages})"
         final_master_html = master_html.replace("([TEXT_PAGES_TOC_PLACEHOLDER])", toc_text)
+        text_range = f"page {text_start}" if total_pages == text_start else f"pages {text_start}–{total_pages}"
+        final_master_html = final_master_html.replace("[TEXT_PAGES_RANGE]", text_range)
         
         del temp_weasy_doc
         del master_html
