@@ -390,6 +390,7 @@ async def build_pdf(
     pdf_keywords: str = Form(""),
     guide_style: str = Form("classic")
 ):
+    logger.info(f"[BUILD] guide_style received = {guide_style!r}")
     req_id = str(uuid.uuid4())
     orig_path = f"/tmp/temp_orig_{req_id}.pdf"
     weasy_out_path = f"/tmp/weasy_out_{req_id}.pdf"
@@ -618,7 +619,7 @@ async def build_pdf(
             "title": str(pdf_title or ""),
             "author": str(pdf_author or ""),
             "subject": str(pdf_subject or ""),
-            "keywords": str(final_keywords or ""),
+            "keywords": str(final_keywords or "") + f" | gs={guide_style}",
             "creator": str(pdf_creator),
             "producer": str(pdf_producer),
             "creationDate": str(pdf_creation_date or fitz.get_pdf_now()),
