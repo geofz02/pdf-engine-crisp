@@ -146,6 +146,262 @@ def _ensure_document_root_elem(pdf: Pdf, struct_root: Dictionary):
     return doc_elem
 
 
+# ===========================================================================
+# CONTENT-COMPLETENESS PASS  (PDF/UA-1 / ISO 14289-1, Clause 7.1, Test 3)
+# ---------------------------------------------------------------------------
+# "Content shall be marked as Artifact or tagged as real content."
+#
+# Some builds leave a small number of decorative path-paint operators (e.g. a
+# per-page background/rule fill emitted by the HTML->PDF renderer) OUTSIDE any
+# marked-content scope. This pass finds each mark-producing PATH-PAINT operator
+# that is not already inside an /Artifact or a structure-referenced (MCID) scope
+# and wraps its whole path object in an /Artifact marked-content sequence.
+#
+# Guardrails:
+#   * Only PATH-PAINT operators are ever wrapped. Text-showing and image
+#     operators are NEVER touched, so real content can never be hidden.
+#   * Content is never dropped or reordered; the whole path object
+#     (construction + clip + paint) is wrapped so the path object is never split.
+#   * Idempotent: paths already inside a scope are left alone, so re-running is
+#     a no-op.
+#   * Fail-safe: callers guard with try/except; on any error the pre-pass
+#     content is kept unchanged.
+# ===========================================================================
+
+_PATH_CONSTRUCT = {"m", "l", "c", "v", "y", "re", "h"}
+_PATH_CLIP = {"W", "W*"}
+_PATH_PAINT_MARK = {"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"}  # produce marks
+_PATH_PAINT_NOMARK = {"n"}  # end path / clip only -> no mark, never wrapped
+
+
+def _objgen(obj):
+    try:
+        return obj.objgen
+    except Exception:
+        return None
+
+
+def _collect_referenced_mcids(pdf: Pdf) -> set:
+    """(page_objgen, mcid) pairs that the structure tree actually references."""
+    referenced = set()
+    root = pdf.Root
+    if Name.StructTreeRoot not in root:
+        return referenced
+    seen = set()
+
+    def walk(elem, pg):
+        oid = _objgen(elem)
+        if oid is not None:
+            if oid in seen:
+                return
+            seen.add(oid)
+        try:
+            if isinstance(elem, Dictionary) and "/Pg" in elem:
+                pg = _objgen(elem.Pg)
+        except Exception:
+            pass
+        try:
+            k = elem.K if (isinstance(elem, Dictionary) and "/K" in elem) else None
+        except Exception:
+            k = None
+        if k is not None:
+            walk_k(k, pg)
+
+    def walk_k(k, pg):
+        if isinstance(k, Array):
+            for it in k:
+                walk_k(it, pg)
+            return
+        if isinstance(k, int):
+            if pg is not None:
+                referenced.add((pg, int(k)))
+            return
+        if not isinstance(k, Dictionary):
+            return
+        ktype = str(k.get("/Type", "")) if "/Type" in k else ""
+        if ktype == "/MCR":
+            mpg = _objgen(k.Pg) if "/Pg" in k else pg
+            if mpg is not None and "/MCID" in k:
+                referenced.add((mpg, int(k.MCID)))
+            return
+        if ktype == "/OBJR":
+            return
+        walk(k, pg)
+
+    walk(root.StructTreeRoot, None)
+    return referenced
+
+
+def _resolve_mcid_props(props, resources):
+    try:
+        if isinstance(props, Dictionary):
+            return int(props.MCID) if "/MCID" in props else None
+        if isinstance(props, Name) and resources is not None and "/Properties" in resources:
+            pd = resources.Properties.get(props, None)
+            if isinstance(pd, Dictionary) and "/MCID" in pd:
+                return int(pd.MCID)
+    except Exception:
+        return None
+    return None
+
+
+def _rewrite_instructions(instructions, resources, page_gen, referenced, pdf, visited):
+    """Return (new_instruction_list, changed). Wraps untagged path objects in
+    /Artifact; recurses into Form XObjects (modifying them in place)."""
+    CSI = pikepdf.ContentStreamInstruction
+    OP = pikepdf.Operator
+    out = []
+    stack = []          # scope kinds: 'artifact' | 'real' | 'other'
+    path_buf = None     # tokens of the path object currently being built
+    changed = False
+
+    def covered():
+        return any(s in ("artifact", "real") for s in stack)
+
+    for item in instructions:
+        if isinstance(item, pikepdf.ContentStreamInlineImage):
+            if path_buf is not None:
+                out.extend(path_buf); path_buf = None
+            out.append(item)            # image: never wrapped
+            continue
+
+        op = str(item.operator)
+
+        if op in _PATH_CONSTRUCT or op in _PATH_CLIP:
+            if path_buf is None:
+                path_buf = []
+            path_buf.append(item)
+            continue
+
+        if op in _PATH_PAINT_MARK or op in _PATH_PAINT_NOMARK:
+            buf = path_buf if path_buf is not None else []
+            buf.append(item)
+            path_buf = None
+            if op in _PATH_PAINT_MARK and not covered():
+                out.append(CSI([Name("/Artifact")], OP("BMC")))
+                out.extend(buf)
+                out.append(CSI([], OP("EMC")))
+                changed = True
+            else:
+                out.extend(buf)
+            continue
+
+        # any non-path operator ends any pending path object defensively
+        if path_buf is not None:
+            out.extend(path_buf); path_buf = None
+
+        if op in ("BDC", "BMC"):
+            tag = item.operands[0] if item.operands else None
+            props = item.operands[1] if len(item.operands) > 1 else None
+            if isinstance(tag, Name) and str(tag) == "/Artifact":
+                stack.append("artifact")
+            else:
+                mcid = _resolve_mcid_props(props, resources) if op == "BDC" else None
+                stack.append("real" if (mcid is not None and (page_gen, mcid) in referenced) else "other")
+            out.append(item)
+            continue
+
+        if op == "EMC":
+            if stack:
+                stack.pop()
+            out.append(item)
+            continue
+
+        if op == "Do":
+            name = item.operands[0] if item.operands else None
+            try:
+                xobj = (resources.XObject.get(name, None)
+                        if (resources is not None and "/XObject" in resources and isinstance(name, Name))
+                        else None)
+            except Exception:
+                xobj = None
+            try:
+                if xobj is not None and "/Subtype" in xobj and str(xobj.Subtype) == "/Form":
+                    if _process_form_xobject(xobj, resources, page_gen, referenced, pdf, visited):
+                        changed = True
+            except Exception:
+                pass
+            out.append(item)
+            continue
+
+        # text-showing ops and everything else: emitted unchanged (never wrapped)
+        out.append(item)
+
+    if path_buf is not None:
+        out.extend(path_buf)
+    return out, changed
+
+
+def _process_form_xobject(xobj, page_resources, page_gen, referenced, pdf, visited):
+    oid = _objgen(xobj)
+    if oid is not None:
+        if oid in visited:
+            return False
+        visited.add(oid)
+    try:
+        instrs = pikepdf.parse_content_stream(xobj)
+    except Exception:
+        return False
+    res = xobj.Resources if "/Resources" in xobj else page_resources
+    new_instrs, changed = _rewrite_instructions(instrs, res, page_gen, referenced, pdf, visited)
+    if changed:
+        try:
+            xobj.write(pikepdf.unparse_content_stream(new_instrs))
+        except Exception:
+            return False
+    return changed
+
+
+def mark_untagged_paths_as_artifacts(pdf: Pdf, verbose: bool = False) -> int:
+    """Wrap every untagged path-paint operator (page content + Form XObjects) in
+    an /Artifact scope. Returns the number of pages modified. Idempotent."""
+    referenced = _collect_referenced_mcids(pdf)
+    visited = set()
+    pages_changed = 0
+    for page in pdf.pages:
+        try:
+            pageobj = page.obj
+            page_gen = _objgen(pageobj)
+            instrs = pikepdf.parse_content_stream(page)
+            resources = pageobj.get("/Resources", None)
+            new_instrs, changed = _rewrite_instructions(
+                instrs, resources, page_gen, referenced, pdf, visited)
+            if changed:
+                data = pikepdf.unparse_content_stream(new_instrs)
+                contents = pageobj.get("/Contents", None)
+                if isinstance(contents, pikepdf.Stream):
+                    contents.write(data)
+                else:
+                    pageobj.Contents = pdf.make_stream(data)
+                pages_changed += 1
+        except Exception as e:
+            if verbose:
+                print(f"  [completeness] page skipped (fail-safe): {e}")
+            continue
+    if verbose:
+        print(f"Content-completeness: wrapped untagged paths on {pages_changed} page(s)")
+    return pages_changed
+
+
+def apply_content_completeness(input_pdf_path: str, output_pdf_path: str,
+                               verbose: bool = False) -> bool:
+    """Standalone entry (used by tests/CLI). Fail-safe: on any error, copies the
+    input to the output unchanged so a good build is never broken."""
+    try:
+        with Pdf.open(input_pdf_path) as pdf:
+            mark_untagged_paths_as_artifacts(pdf, verbose=verbose)
+            pdf.save(output_pdf_path,
+                     object_stream_mode=pikepdf.ObjectStreamMode.disable)
+        return True
+    except Exception as e:
+        if verbose:
+            print(f"completeness pass failed, keeping input unchanged: {e}")
+        import shutil
+        if input_pdf_path != output_pdf_path:
+            shutil.copyfile(input_pdf_path, output_pdf_path)
+        return False
+
+
 def repair_pdfua_annotations(
     input_pdf_path: str,
     output_pdf_path: str,
@@ -231,6 +487,16 @@ def repair_pdfua_annotations(
 
         struct_root[Name.ParentTreeNextKey] = next_key
 
+        # Final content-completeness pass (PDF/UA-1 7.1 Test 3): wrap any
+        # untagged decorative path-paint operators in /Artifact. Fail-safe:
+        # a failure here must never break an otherwise-good build.
+        paths_pages = 0
+        try:
+            paths_pages = mark_untagged_paths_as_artifacts(pdf, verbose=verbose)
+        except Exception as e:
+            if verbose:
+                print(f"Content-completeness pass skipped (fail-safe): {e}")
+
         pdf.save(
             output_pdf_path,
             compress_streams=True,
@@ -240,6 +506,7 @@ def repair_pdfua_annotations(
         if verbose:
             print(f"Repaired widgets: {widgets_repaired}")
             print(f"Repaired links:   {links_repaired}")
+            print(f"Artifact-wrapped pages: {paths_pages}")
             print(f"Saved: {output_pdf_path}")
 
         return widgets_repaired, links_repaired
