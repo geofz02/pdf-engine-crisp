@@ -13,9 +13,31 @@ import gc  # Garbage Collector
 import time
 from datetime import datetime
 
-# --- CRITICAL FASTAPI 1MB LIMIT FIX ---
+# --- LARGE UPLOAD SUPPORT: accept source PDFs up to MAX_PDF_UPLOAD_MB (default 600) ---
+# Source PDFs arrive as multipart file parts and are streamed to a temp file by the
+# endpoints below. Ensure the multipart parser never rejects a large part by size.
+# NOTE: Starlette 0.36.x (current pin) has no hard per-part cap - file parts spool to
+# disk - so raising this is effectively a no-op today. It also future-proofs against
+# Starlette versions that DO enforce a per-part cap: their per-instance default would
+# shadow a bare class-attribute assignment, so we also force it after construction.
+# We do NOT raise the in-memory spool threshold, so large uploads keep streaming to
+# disk instead of into RAM.
 import starlette.formparsers
-starlette.formparsers.MultiPartParser.max_part_size = 100 * 1024 * 1024
+
+MAX_PDF_UPLOAD_MB = int(os.getenv("MAX_PDF_UPLOAD_MB", "600"))
+_MAX_UPLOAD_BYTES = MAX_PDF_UPLOAD_MB * 1024 * 1024
+
+starlette.formparsers.MultiPartParser.max_part_size = _MAX_UPLOAD_BYTES
+
+_orig_multipart_init = starlette.formparsers.MultiPartParser.__init__
+def _multipart_init_no_limit(self, *args, **kwargs):
+    _orig_multipart_init(self, *args, **kwargs)
+    try:
+        if hasattr(self, "max_part_size"):
+            self.max_part_size = _MAX_UPLOAD_BYTES
+    except Exception:
+        pass
+starlette.formparsers.MultiPartParser.__init__ = _multipart_init_no_limit
 
 # --- V4 SUPABASE ENGINE IMPORT ---
 from supabase import create_client, Client
@@ -682,9 +704,12 @@ async def build_pdf(
 
 @app.post("/split")
 async def split_pdf_legacy(file: UploadFile = File(...)):
+    tmp_pdf = f"/tmp/split_legacy_{uuid.uuid4()}.pdf"
     try:
-        content = await file.read()
-        doc = fitz.open(stream=content, filetype="pdf")
+        # Stream to a temp file (do not read the whole PDF into memory).
+        with open(tmp_pdf, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        doc = fitz.open(tmp_pdf)
         meta = doc.metadata
         metadata_payload = {
             "title": meta.get("title") or "Accessible Document",
@@ -709,3 +734,9 @@ async def split_pdf_legacy(file: UploadFile = File(...)):
         return {"metadata": metadata_payload, "total_chunks": len(chunks), "chunks": chunks}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if os.path.exists(tmp_pdf):
+            try:
+                os.remove(tmp_pdf)
+            except Exception:
+                pass
